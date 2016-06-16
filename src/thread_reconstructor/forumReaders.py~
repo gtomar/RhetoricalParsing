@@ -1,0 +1,177 @@
+from __future__ import division
+from scipy.stats.stats import pearsonr, linregress
+from collections       import Counter
+import csv, os, math
+import pickle, pdb
+from Post import Post
+""" 
+Library code to recover implicit thread structure using cues in posts
+  The final part extracts threads which include posts
+  referencing at least two users by name
+
+@author: (Keith Maki)
+@Version (5/10/15)
+"""
+
+##### User Parameters #####
+corpusdir  = '/home/maki/Downloads/'
+corpusfile = 'python_forum_Coursera.csv'
+
+headerrows = 1
+idCol     = 0
+aidCol    = 1
+threadCol = 2
+userCol   = 3
+groupCol  = 4
+timeCol   = 5
+textCol   = 6
+permalink = 10
+
+### End User Parameters ###
+### Constant aliases for readability ###
+THREAD_SNAPSHOTS = 0
+THREAD_SNAPSHOT_POSTID = 0
+THREAD_SNAPSHOT_USER_RECENT_ACTIVITY = 1
+THREAD_SNAPSHOT_POST_HISTORY = 2
+THREAD_SNAPSHOT_STRUCTURE = 3
+THREAD_USER_RECENT_ACTIVITY = 1
+THREAD_POST_HISTORY = 2
+THREAD_STRUCTURE = 3
+###
+
+def avg(l, ind, cfun): 
+  if len(l) > 0:
+    return sum([cfun(el[ind]) for el in l])/len(l)
+  return 0
+
+def fixIDErrors(line,posts,openPID,openCID):
+  """
+  void method to enforce metadata sanity
+  """
+  if line[idCol] == '' or line[idCol]==line[aidCol]:
+    if line[aidCol] == '':
+      line[idCol] = "post-x"+str(openPID)
+      openPID = openPID+1
+    else:
+      line[idCol] = "comment-x"+str(openCID)
+      openCID = openCID+1  
+  return openPID,openCID
+
+def loadCorpus(fname):
+  # load corpus
+  fin = csv.reader(open(fname,'rb'))
+  for i in range(headerrows): header = fin.next() # strip header rows
+  #pid, aid, tid, uid, gid, timestamp, text, [other info], names
+  header = [header[5],header[2],header[9],header[4],"group_id",header[13],header[7]]+[header[i] for i in range(17) if not i in [5,2,9,4,13,7]]+["Names"]
+  header[textCol] = header[textCol].replace("\xc2\xa0"," ")
+  # extract lines sorted by timestamp
+  lines   = sorted([[line[5],line[2],line[9],line[4],0,line[13],line[7]]+[line[i] for i in range(17) if not i in [5,2,9,4,13,7]] for line in fin], key=lambda x:x[5])
+  for line in lines:
+    # Replace any consecutive whitespace with a single space
+    line[textCol] = line[textCol].replace("\xc2\xa0"," ")
+    line[textCol] = " ".join([el.strip() for el in line[textCol].split() if el.strip()])
+  threads = {}
+  users   = {}
+  posts   = {}
+  openPID = 0
+  openCID = 0
+  for line in lines:
+  
+    openPID,openCID = fixIDErrors(line,posts,openPID,openCID)
+
+    postID = line[idCol]
+    userID = line[userCol]
+    thread = threads.setdefault(line[threadCol], 
+                                ([],{},[],{"top":[]}))
+    threadSnapshot = (line[idCol],thread[THREAD_USER_RECENT_ACTIVITY].copy(),
+                      list(thread[THREAD_POST_HISTORY]),
+                      dict(thread[THREAD_STRUCTURE]))
+    thread[THREAD_SNAPSHOTS].append(threadSnapshot)
+    thread[THREAD_USER_RECENT_ACTIVITY][userID] = postID
+    thread[THREAD_POST_HISTORY].append(postID)
+    # Build thread structure metadata information
+    if "post" in postID:
+      thread[THREAD_STRUCTURE]["top"].append(postID)
+    else:
+      aid = line[aidCol]
+      if not aid:
+        aid = thread[THREAD_POST_HISTORY][-1]
+      if aid not in thread[THREAD_STRUCTURE]:
+        thread[THREAD_STRUCTURE][aid] = []
+      thread[THREAD_STRUCTURE][aid].append(postID)
+
+    users.setdefault(userID,[]).append(postID)  
+    posts[postID] = line
+
+  return (threads, users, posts)
+
+def recoverStructure(threads,users,posts):
+
+  aliases = {}
+  for user in users.keys():
+    if " " in user:
+      aliases[user] = set([name.capitalize() for name in user.split()]\
+                          +user.lower().split()+user.split())
+    else:
+      aliases[user] = set([user.capitalize()]+[user.upper()]+[user.lower()])
+
+  def matchNamesInSet(text, names):
+    try:
+      clauses  = [clause for chunk  in text.split(".") 
+                         for sent   in chunk.split("!") 
+                         for clause in sent.split(",") if clause]
+      return set([name   for clause in clauses 
+                         for word   in clause.split() 
+                         for name   in names
+                    if word.lower() in aliases[name]
+                  and not word.lower() == username.lower().split()[0]])
+    except:
+      pdb.set_trace()
+  counts = {}
+  names_matched = {}
+  threadsInfo = {}
+  postsInfo = {}
+  for (tid, thread) in threads.iteritems():
+    counts[tid] = {}
+    threadsInfo[tid] = []
+    for snapshot in thread[THREAD_SNAPSHOTS]:
+      pid  = snapshot[THREAD_SNAPSHOT_POSTID]
+      names = set(snapshot[THREAD_SNAPSHOT_USER_RECENT_ACTIVITY].keys())
+      history = snapshot[THREAD_SNAPSHOT_POST_HISTORY]
+      # update referenced posts' child counts
+      # add a child to most recent post by name for each name referenced
+      post = posts[pid]
+      username = post[userCol]
+      names_matched[pid] = matchNamesInSet(post[textCol],\
+                                           names.difference([username]))
+      for name in names_matched[pid]:
+        mostrecent = snapshot[THREAD_SNAPSHOT_USER_RECENT_ACTIVITY][name]
+        counts[tid][mostrecent] = counts[tid].setdefault(mostrecent,0)+1
+
+      # update parent post's child counts
+      aid = post[aidCol]
+      postInfo = Post(pid,post[textCol],post[timeCol],post[groupCol])
+      if not aid:
+        # treat this post as a child of the preceeding post in thread
+        try:
+          aid = history[-1]
+        except:
+          # this is the first post of the thread!
+          threadsInfo[tid].append(postInfo)
+          postsInfo[pid] = postInfo
+          continue
+      # add this Post as a child to the appropriate parent
+      if aid in postsInfo.keys():
+        postsInfo[aid].add_child(postInfo)
+      else:
+        #something went wrong, this post's ancestor is no longer here!
+        print "Post ID {0} missing! Thread info: {1}".format(aid,
+                                                             post[permalink])
+        threadsInfo[tid].append(postInfo)
+      postsInfo[pid] = postInfo
+      
+  return threadsInfo
+
+def coursera(fname):
+  """Method to read in the forum"""
+  return recoverStructure(*loadCorpus(fname))
